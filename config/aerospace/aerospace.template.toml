@@ -31,7 +31,7 @@ default-root-container-layout = 'tiles'
 # rule the dwindle hint below applies to every window after it
 default-root-container-orientation = 'auto'
 
-on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
+on-focused-monitor-changed = []
 
 # Hyprland's dwindle splits the focused window along ITS longer edge,
 # so the next window lands beside a wide one and below a tall one.
