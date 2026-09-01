@@ -2220,6 +2220,63 @@ let barRevealLevel = NSWindow.Level(rawValue: 1002)
 let revealEdge: CGFloat = 2 // how close to the top edge counts as asking
 var revealed = false
 
+// The auto-hidden native menu bar slides into the same strip the bar
+// occupies, and it is translucent — the bar's pixels bleed through the
+// menu titles. While hidden its window is absent from the on-screen list
+// entirely (measured), so presence of a Window Server window at the
+// main-menu layer intersecting a display's top strip IS the reveal.
+// Polled on a timer rather than from the mouse monitor: menu tracking is
+// a modal loop and global monitors can go quiet inside it.
+let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+var nativeMenuBarShown: Set<CGDirectDisplayID> = []
+var nativeMenuBarPoll: Timer?
+
+func nativeMenuBarDisplays() -> Set<CGDirectDisplayID> {
+    var shown: Set<CGDirectDisplayID> = []
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+    else { return shown }
+    for window in list {
+        guard (window[kCGWindowLayer as String] as? Int) == menuBarLayer,
+              let owner = window[kCGWindowOwnerName as String] as? String,
+              owner == "Window Server" || owner == "WindowManager",
+              let b = window[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+        let rect = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+        for surface in surfaces {
+            let id = screenID(surface.screen)
+            let display = CGDisplayBounds(id)
+            if rect.intersection(display).height > 1, rect.origin.y - display.origin.y < 50 {
+                shown.insert(id)
+            }
+        }
+    }
+    return shown
+}
+
+func pollNativeMenuBar() {
+    let now = nativeMenuBarDisplays()
+    if now != nativeMenuBarShown {
+        nativeMenuBarShown = now
+        updateBarVisibility()
+    }
+    // keep polling while the menu bar is out OR the pointer is still near
+    // the top edge (the reveal animation lags the gesture by a beat)
+    let p = NSEvent.mouseLocation
+    let nearTop = NSScreen.screens.contains {
+        $0.frame.insetBy(dx: 0, dy: -2).contains(p) && $0.frame.maxY - p.y <= 50
+    }
+    if now.isEmpty, !nearTop {
+        nativeMenuBarPoll?.invalidate()
+        nativeMenuBarPoll = nil
+    }
+}
+
+func startNativeMenuBarPoll() {
+    guard nativeMenuBarPoll == nil else { return }
+    nativeMenuBarPoll = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
+        pollNativeMenuBar()
+    }
+}
+
 func setRevealed(_ show: Bool) {
     guard show != revealed else { return }
     revealed = show
@@ -2241,10 +2298,14 @@ func pointerAtScreenTop() {
     let fromTop = screen.frame.maxY - p.y
     if fromTop <= revealEdge {
         // Climb only over a fullscreen window. On a normal desktop the
-        // same gesture means the auto-hidden native menu bar, and at
-        // barRevealLevel the bar sits on top of it — stay at -20 and let
-        // the menu bar draw over us instead.
-        if fullscreenDisplays().contains(screenID(screen)) { setRevealed(true) }
+        // same gesture means the auto-hidden native menu bar — hand the
+        // strip over to it instead (the poll hides the bar while the
+        // menu bar is out).
+        if fullscreenDisplays().contains(screenID(screen)) {
+            setRevealed(true)
+        } else {
+            startNativeMenuBarPoll()
+        }
     } else if revealed, openPopup == nil, fromTop > barHeight + 12 {
         // a popup keeps it up: its anchor must not vanish under the pointer
         setRevealed(false)
@@ -2254,7 +2315,8 @@ func pointerAtScreenTop() {
 func updateBarVisibility() {
     let covered = fullscreenDisplays()
     for surface in surfaces {
-        let hide = covered.contains(screenID(surface.screen)) && !revealed
+        let id = screenID(surface.screen)
+        let hide = (covered.contains(id) && !revealed) || nativeMenuBarShown.contains(id)
         // unconditional either way: isVisible can desync from the window
         // server, which is how borders.swift ended up with a stuck shroud
         if hide {
