@@ -959,8 +959,16 @@ func updateWeather() {
 // --- codex/claude usage (CodexBar already asked; read what it wrote)
 // CodexBar polls OpenAI and Anthropic every five minutes and persists what
 // it learns. Asking the same endpoints again would double the request rate
-// for the same numbers, so this pill watches its files instead. Both are
-// rewritten atomically, which watch() sees as a rename and re-arms on.
+// for the same numbers, so codex comes off its snapshot file, watched
+// rather than polled — it is rewritten atomically, which watch() sees as a
+// rename and re-arms on.
+//
+// Claude's file keeps only the session and weekly percentages; the pace it
+// shows (deficit, projected empty) is computed live and lands on no disk.
+// CodexBar's own CLI answers with both, holding its own session, so no
+// credential of ours is involved. It reaches the network — nine seconds,
+// measured — so it runs on the timer and on wake, never on the watcher,
+// and the file stays as the fallback.
 
 // Percentages are quota LEFT, the way CodexBar's own menu reads them, so
 // the two agree at a glance. A window that overran its allowance reports
@@ -969,6 +977,8 @@ struct UsageWindow {
     var title = ""
     var left = 0
     var reset = ""
+    var pace = ""
+    var deficit = 0 // points spent ahead of an even burn, 0 when on track
 }
 
 struct UsageProvider {
@@ -976,15 +986,30 @@ struct UsageProvider {
     var short = ""
     var windows: [UsageWindow] = []
     var note = ""
+    var source = ""
     var updated = Date.distantPast
     var binding: Int { windows.map(\.left).min() ?? 100 }
+    var deficit: Int { windows.map(\.deficit).max() ?? 0 }
+
+    // The session window is what bites during a working day, so it leads
+    // whether or not the weekly is thinner; providers without one (codex)
+    // fall back to whichever window is closest to empty.
+    var pill: String {
+        guard let session = windows.first(where: { $0.title == "session" }) else {
+            return "\(short) \(binding)%"
+        }
+        let weekly = windows.first { $0.title == "weekly" }
+        return "\(short) \(session.left)%" + (weekly.map { " wk \($0.left)%" } ?? "")
+    }
 }
 
 let usageGlyph = "\u{F06A9}"
+let usageAlertGlyph = "\u{F0026}"
 let codexUsagePath =
     "\(NSHomeDirectory())/Library/Application Support/CodexBar/codex-account-snapshots.json"
 let claudeUsagePath =
     "\(NSHomeDirectory())/Library/Application Support/com.steipete.codexbar/history/claude.json"
+let codexBarCLI = "/Applications/CodexBar.app/Contents/Helpers/CodexBarCLI"
 let usageStaleAfter: TimeInterval = 2 * 3600
 
 var usage: [UsageProvider] = []
@@ -1052,6 +1077,57 @@ func codexUsage() -> UsageProvider? {
     return provider.windows.isEmpty ? nil : provider
 }
 
+// "6% in deficit | Expected 10% used | Projected empty in 2h 44m" — the
+// middle term is the other two restated, so it goes.
+func usagePace(_ d: [String: Any]) -> (text: String, deficit: Int) {
+    let summary = d["summary"] as? String ?? ""
+    let parts = summary.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    let text = (parts.count > 2 ? [parts[0], parts[parts.count - 1]] : parts)
+        .joined(separator: " · ").lowercased()
+    let delta = Int((d["deltaPercent"] as? Double ?? 0).rounded())
+    let lasts = d["willLastToReset"] as? Bool ?? true
+    let spending = summary.lowercased().contains("deficit") || (!lasts && delta > 0)
+    return (text, spending ? max(0, delta) : 0)
+}
+
+func claudeLiveUsage() -> UsageProvider? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: codexBarCLI)
+    p.arguments = ["usage", "--provider", "claude", "--json"]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return nil }
+    let watchdog = DispatchWorkItem { if p.isRunning { p.terminate() } }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 30, execute: watchdog)
+    // drain before waiting: a child that fills the pipe blocks until it is read
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    watchdog.cancel()
+
+    let iso = ISO8601DateFormatter()
+    // a failed lookup answers with an error object in the same array
+    guard p.terminationStatus == 0,
+          let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+          let row = rows.first(where: { $0["usage"] is [String: Any] }),
+          let windows = row["usage"] as? [String: Any],
+          let stamp = iso.date(from: windows["updatedAt"] as? String ?? "")
+    else { return nil }
+
+    let pace = row["pace"] as? [String: Any] ?? [:]
+    var provider = UsageProvider(name: "claude", short: "CL", source: "live", updated: stamp)
+    for (key, title) in [("primary", "session"), ("secondary", "weekly")] {
+        guard let d = windows[key] as? [String: Any], let used = d["usedPercent"] as? Double else { continue }
+        var window = UsageWindow(title: title, left: 100 - Int(used.rounded()))
+        if let at = iso.date(from: d["resetsAt"] as? String ?? "") { window.reset = usageReset(at) }
+        if let measure = pace[key] as? [String: Any] {
+            (window.pace, window.deficit) = usagePace(measure)
+        }
+        provider.windows.append(window)
+    }
+    return provider.windows.isEmpty ? nil : provider
+}
+
 func claudeUsage() -> UsageProvider? {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: claudeUsagePath)),
           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1094,7 +1170,7 @@ func claudeUsage() -> UsageProvider? {
     // A window the plan stopped reporting (an old opus quota) keeps its
     // last reading in the file forever; only what was captured alongside
     // the newest reading is still being measured.
-    var provider = UsageProvider(name: "claude", short: "CL", updated: newest)
+    var provider = UsageProvider(name: "claude", short: "CL", source: "cache", updated: newest)
     for r in readings where newest.timeIntervalSince(r.at) < usageStaleAfter {
         provider.windows.append(UsageWindow(title: r.title, left: r.left,
                                             reset: r.reset.map(usageReset) ?? ""))
@@ -1102,29 +1178,45 @@ func claudeUsage() -> UsageProvider? {
     return provider.windows.isEmpty ? nil : provider
 }
 
-func updateUsage() {
+// The last live reading, kept so a file event cannot demote the pill to
+// the cache's thinner numbers between CLI runs.
+var claudeLive: UsageProvider?
+
+func updateUsage(live: Bool = false) {
+    let held = claudeLive
     DispatchQueue.global(qos: .utility).async {
-        let providers = [codexUsage(), claudeUsage()].compactMap { $0 }
+        let codex = codexUsage()
+        var claude = live ? claudeLiveUsage() : nil
+        if claude == nil, let held, Date().timeIntervalSince(held.updated) < usageStaleAfter {
+            claude = held
+        }
+        let providers = [codex, claude ?? claudeUsage()].compactMap { $0 }
         DispatchQueue.main.async {
+            if let claude, claude.source == "live" { claudeLive = claude }
             usage = providers
             guard let newest = providers.map(\.updated).max() else {
                 set("usage") { $0.drawing = false } // no CodexBar, no numbers to invent
                 return
             }
             let thinnest = providers.map(\.binding).min() ?? 100
+            let deficit = providers.map(\.deficit).max() ?? 0
             var tint = palette.accent
             if Date().timeIntervalSince(newest) > usageStaleAfter {
                 tint = palette.muted
-            } else if thinnest <= 10 {
+            } else if thinnest <= 10 || deficit > 0 {
                 tint = palette.red
             } else if thinnest <= 30 {
                 tint = palette.yellow
             }
             set("usage") {
                 $0.drawing = true
-                $0.icon = usageGlyph
+                // burning faster than the window refills is a state, and the
+                // glyph is where this bar puts state — battery does the same
+                $0.icon = deficit > 0 ? usageAlertGlyph : usageGlyph
                 $0.iconColor = tint
-                $0.label = providers.map { "\($0.short) \($0.binding)%" }.joined(separator: " · ")
+                var label = providers.map(\.pill).joined(separator: " · ")
+                if deficit > 0 { label += " -\(deficit)%" }
+                $0.label = label
             }
             if openPopup == "usage" { refreshPopup() }
         }
@@ -1566,13 +1658,15 @@ func usageRows() -> [PopupRow] {
             var line = "\(provider.name) \(w.title) \(w.left)% left"
             if !w.reset.isEmpty { line += " · resets in \(w.reset)" }
             rows.append(PopupRow(text: line))
+            if !w.pace.isEmpty { rows.append(PopupRow(text: w.pace, dim: true)) }
         }
         if !provider.note.isEmpty { rows.append(PopupRow(text: provider.note, dim: true)) }
     }
     if let newest = usage.map(\.updated).max() {
-        let age = "updated \(usageAge(newest))"
-        rows.append(PopupRow(text: Date().timeIntervalSince(newest) > usageStaleAfter
-                                ? "stale · \(age)" : age, dim: true))
+        var footer = usage.compactMap { $0.source.isEmpty ? nil : "\($0.name) \($0.source)" }
+        footer.append("updated \(usageAge(newest))")
+        if Date().timeIntervalSince(newest) > usageStaleAfter { footer.insert("stale", at: 0) }
+        rows.append(PopupRow(text: footer.joined(separator: " · "), dim: true))
     }
     return rows
 }
@@ -2884,10 +2978,14 @@ locationGate.start()
 // bluetooth: gated on the privacy grant, which the watcher above also needs
 bluetoothWatcher.start()
 
-// waking clears the gamma table, so the shade has to be reasserted
+// waking clears the gamma table, so the shade has to be reasserted — and
+// the quotas moved while the lid was shut
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-) { _ in applyShade() }
+) { _ in
+    applyShade()
+    updateUsage(live: true)
+}
 
 // media: Spotify broadcasts every state change itself, and the payload
 // already carries the track — so the pill repaints without asking anyone
@@ -2918,7 +3016,7 @@ func scheduleClock() {
 scheduleClock()
 
 Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather() }
-Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in updateUsage() }
+Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in updateUsage(live: true) }
 
 // --- go -------------------------------------------------------------------
 
@@ -2937,7 +3035,7 @@ updateBattery()
 updateBrightness()
 updateWifi()
 updateWeather()
-updateUsage()
+updateUsage(live: true)
 repaint()
 primeMedia()
 tlog("omacosy-bar up on " + surfaces.map { "\($0.screen.localizedName)=m\($0.monitorID)\($0.notched ? " (notched)" : "")" }.joined(separator: ", "))
