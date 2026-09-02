@@ -346,10 +346,20 @@ func spotify(_ command: String) {
 // list, so adding a pill is one entry and one provider — no per-item
 // geometry, no padding arithmetic, no width caches.
 
+// A pill is normally one glyph and one string in one colour each. A run
+// is the exception: a pill that has to carry two providers' marks, and
+// their state, in one line.
+struct BarRun: Equatable {
+    var text = ""
+    var color: NSColor?
+    var glyph = false // measured and centred on ink, the way an icon is
+}
+
 struct BarItem: Equatable {
     var icon = ""
     var label = ""
     var iconColor: NSColor?
+    var runs: [BarRun] = []
     var drawing = true
 }
 
@@ -984,6 +994,8 @@ struct UsageWindow {
 struct UsageProvider {
     var name = ""
     var short = ""
+    var glyph = ""
+    var tint = NSColor.white
     var windows: [UsageWindow] = []
     var note = ""
     var source = ""
@@ -996,14 +1008,21 @@ struct UsageProvider {
     // fall back to whichever window is closest to empty.
     var pill: String {
         guard let session = windows.first(where: { $0.title == "session" }) else {
-            return "\(short) \(binding)%"
+            return "\(binding)%"
         }
         let weekly = windows.first { $0.title == "weekly" }
-        return "\(short) \(session.left)%" + (weekly.map { " wk \($0.left)%" } ?? "")
+        return "\(session.left)%" + (weekly.map { " wk \($0.left)%" } ?? "")
     }
 }
 
-let usageGlyph = "\u{F06A9}"
+// The two marks the font already carries, verified present rather than
+// taken from a cheat sheet, and their brand colours — deliberately not
+// themed, because a logo that changes hue with the wallpaper stops being
+// one. Both stay legible against every palette's item background.
+let codexGlyph = "\u{EC81}"
+let claudeGlyph = "\u{EC82}"
+let codexTint = NSColor(srgbRed: 0.498, green: 0.659, blue: 0.722, alpha: 1)
+let claudeTint = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1)
 let usageAlertGlyph = "\u{F0026}"
 let codexUsagePath =
     "\(NSHomeDirectory())/Library/Application Support/CodexBar/codex-account-snapshots.json"
@@ -1062,7 +1081,7 @@ func codexUsage() -> UsageProvider? {
         return w
     }
 
-    var provider = UsageProvider(name: "codex", short: "CX",
+    var provider = UsageProvider(name: "codex", short: "CX", glyph: codexGlyph, tint: codexTint,
                                  updated: Date(timeIntervalSinceReferenceDate: updated))
     for key in ["primary", "secondary", "tertiary"] {
         if let w = read(snapshot[key]) { provider.windows.append(w) }
@@ -1115,7 +1134,8 @@ func claudeLiveUsage() -> UsageProvider? {
     else { return nil }
 
     let pace = row["pace"] as? [String: Any] ?? [:]
-    var provider = UsageProvider(name: "claude", short: "CL", source: "live", updated: stamp)
+    var provider = UsageProvider(name: "claude", short: "CL", glyph: claudeGlyph, tint: claudeTint,
+                                 source: "live", updated: stamp)
     for (key, title) in [("primary", "session"), ("secondary", "weekly")] {
         guard let d = windows[key] as? [String: Any], let used = d["usedPercent"] as? Double else { continue }
         var window = UsageWindow(title: title, left: 100 - Int(used.rounded()))
@@ -1170,7 +1190,8 @@ func claudeUsage() -> UsageProvider? {
     // A window the plan stopped reporting (an old opus quota) keeps its
     // last reading in the file forever; only what was captured alongside
     // the newest reading is still being measured.
-    var provider = UsageProvider(name: "claude", short: "CL", source: "cache", updated: newest)
+    var provider = UsageProvider(name: "claude", short: "CL", glyph: claudeGlyph, tint: claudeTint,
+                                 source: "cache", updated: newest)
     for r in readings where newest.timeIntervalSince(r.at) < usageStaleAfter {
         provider.windows.append(UsageWindow(title: r.title, left: r.left,
                                             reset: r.reset.map(usageReset) ?? ""))
@@ -1198,25 +1219,35 @@ func updateUsage(live: Bool = false) {
                 set("usage") { $0.drawing = false } // no CodexBar, no numbers to invent
                 return
             }
-            let thinnest = providers.map(\.binding).min() ?? 100
-            let deficit = providers.map(\.deficit).max() ?? 0
-            var tint = palette.accent
-            if Date().timeIntervalSince(newest) > usageStaleAfter {
-                tint = palette.muted
-            } else if thinnest <= 10 || deficit > 0 {
-                tint = palette.red
-            } else if thinnest <= 30 {
-                tint = palette.yellow
+            let stale = Date().timeIntervalSince(newest) > usageStaleAfter
+
+            // Each mark carries its own provider's state: the brand colour
+            // while there is room, the bar's own warning colours when there
+            // is not. Two providers, two verdicts, one line.
+            var runs: [BarRun] = []
+            for provider in providers {
+                var tint = provider.tint
+                if stale {
+                    tint = palette.muted
+                } else if provider.deficit > 0 || provider.binding <= 10 {
+                    tint = palette.red
+                } else if provider.binding <= 30 {
+                    tint = palette.yellow
+                }
+                if !runs.isEmpty { runs.append(BarRun(text: " · ")) }
+                runs.append(BarRun(text: provider.glyph, color: tint, glyph: true))
+                runs.append(BarRun(text: " " + provider.pill, color: stale ? palette.muted : nil))
+                if provider.deficit > 0 {
+                    // the gap belongs in a text run: a glyph run is measured
+                    // on its ink, which no leading space survives
+                    runs.append(BarRun(text: " "))
+                    runs.append(BarRun(text: usageAlertGlyph, color: palette.red, glyph: true))
+                    runs.append(BarRun(text: " -\(provider.deficit)%", color: palette.red))
+                }
             }
             set("usage") {
                 $0.drawing = true
-                // burning faster than the window refills is a state, and the
-                // glyph is where this bar puts state — battery does the same
-                $0.icon = deficit > 0 ? usageAlertGlyph : usageGlyph
-                $0.iconColor = tint
-                var label = providers.map(\.pill).joined(separator: " · ")
-                if deficit > 0 { label += " -\(deficit)%" }
-                $0.label = label
+                $0.runs = runs
             }
             if openPopup == "usage" { refreshPopup() }
         }
@@ -1649,9 +1680,8 @@ func weatherRows() -> [PopupRow] {
 func usageRows() -> [PopupRow] {
     guard !usage.isEmpty else { return [] }
     var rows: [PopupRow] = [
-        PopupRow(icon: usageGlyph,
-                 text: usage.map { "\($0.name) \($0.binding)%" }.joined(separator: " · ") + " left",
-                 hero: true),
+        PopupRow(text: usage.map { "\($0.glyph) \($0.name) \($0.binding)%" }
+            .joined(separator: " · ") + " left", hero: true),
     ]
     for provider in usage {
         for w in provider.windows {
@@ -2199,9 +2229,37 @@ final class BarView: NSView {
         var cursor = bounds.maxX - padLeft
         for name in rightOrder.reversed() {
             guard let item = rightItems[name], item.drawing,
-                  !(item.icon.isEmpty && item.label.isEmpty) else { continue }
+                  !(item.icon.isEmpty && item.label.isEmpty && item.runs.isEmpty) else { continue }
             let labelFont = chipFont
             let iconColor = item.iconColor ?? palette.label
+
+            // a run pill measures and draws itself; the spacing lives in the
+            // runs' own text, so there is no gap arithmetic to get wrong
+            if !item.runs.isEmpty {
+                let widths = item.runs.map {
+                    $0.glyph ? inkBox($0.text, iconFont).width : advance($0.text, labelFont)
+                }
+                let width = 10 + widths.reduce(0, +) + 10
+                let pill = NSRect(x: cursor - width, y: (barHeight - pillHeight) / 2,
+                                  width: width, height: pillHeight)
+                palette.itemBG.setFill()
+                NSBezierPath(roundedRect: pill, xRadius: radius, yRadius: radius).fill()
+                var x = pill.minX + 10
+                for (run, w) in zip(item.runs, widths) {
+                    let color = run.color ?? palette.label
+                    if run.glyph {
+                        drawIcon(run.text, iconFont, color,
+                                 centeredIn: NSRect(x: x, y: pill.minY, width: w, height: pill.height))
+                    } else {
+                        drawText(run.text, labelFont, color, leftAt: x, midY: pill.midY)
+                    }
+                    x += w
+                }
+                itemRects.append((name, NSRect(x: pill.minX, y: 0, width: width, height: barHeight)))
+                cursor = pill.minX - gap
+                continue
+            }
+
             let hasIcon = !item.icon.isEmpty
             let hasLabel = !item.label.isEmpty
             // An icon-only pill is sized and centred on the glyph's INK, so
