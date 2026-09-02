@@ -600,7 +600,7 @@ struct BarItem: Equatable {
 }
 
 // screen order, left to right
-let rightOrder = ["weather", "wifi", "bluetooth", "brightness", "volume", "battery", "clock", "activity"]
+let rightOrder = ["usage", "weather", "wifi", "bluetooth", "brightness", "volume", "battery", "clock", "activity"]
 var rightItems: [String: BarItem] = [:]
 
 func set(_ name: String, _ mutate: (inout BarItem) -> Void) {
@@ -1202,6 +1202,192 @@ func updateWeather() {
     }.resume()
 }
 
+// --- codex/claude usage (CodexBar already asked; read what it wrote)
+// CodexBar polls OpenAI and Anthropic every five minutes and persists what
+// it learns. Asking the same endpoints again would double the request rate
+// for the same numbers, so this pill watches its files instead. Both are
+// rewritten atomically, which watch() sees as a rename and re-arms on.
+
+// Percentages are quota LEFT, the way CodexBar's own menu reads them, so
+// the two agree at a glance. A window that overran its allowance reports
+// more than 100 used, which lands here as a negative.
+struct UsageWindow {
+    var title = ""
+    var left = 0
+    var reset = ""
+}
+
+struct UsageProvider {
+    var name = ""
+    var short = ""
+    var windows: [UsageWindow] = []
+    var note = ""
+    var updated = Date.distantPast
+    var binding: Int { windows.map(\.left).min() ?? 100 }
+}
+
+let usageGlyph = "\u{F06A9}"
+let codexUsagePath =
+    "\(NSHomeDirectory())/Library/Application Support/CodexBar/codex-account-snapshots.json"
+let claudeUsagePath =
+    "\(NSHomeDirectory())/Library/Application Support/com.steipete.codexbar/history/claude.json"
+let usageStaleAfter: TimeInterval = 2 * 3600
+
+var usage: [UsageProvider] = []
+
+func usageSpan(_ minutes: Int) -> String {
+    switch minutes {
+    case 10080: return "weekly"
+    case 1..<1440: return "\(max(1, minutes / 60))-hour"
+    case 1440...: return "\(minutes / 1440)-day"
+    default: return "window"
+    }
+}
+
+func usageReset(_ date: Date) -> String {
+    let seconds = Int(date.timeIntervalSinceNow)
+    if seconds <= 0 { return "any moment" }
+    if seconds < 3600 { return "\(seconds / 60)m" }
+    if seconds < 86400 { return "\(seconds / 3600)h \((seconds % 3600) / 60)m" }
+    return "\(seconds / 86400)d \((seconds % 86400) / 3600)h"
+}
+
+func usageAge(_ date: Date) -> String {
+    let seconds = max(0, Int(Date().timeIntervalSince(date)))
+    if seconds < 90 { return "just now" }
+    if seconds < 3600 { return "\(seconds / 60)m ago" }
+    if seconds < 86400 { return "\(seconds / 3600)h ago" }
+    return "\(seconds / 86400)d ago"
+}
+
+func codexUsage() -> UsageProvider? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: codexUsagePath)),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let records = root["records"] as? [[String: Any]]
+    else { return nil }
+    let snapshots = records.compactMap { $0["snapshot"] as? [String: Any] }
+    guard let snapshot = snapshots.max(by: {
+              ($0["updatedAt"] as? Double ?? 0) < ($1["updatedAt"] as? Double ?? 0)
+          }),
+          let updated = snapshot["updatedAt"] as? Double
+    else { return nil }
+
+    // resetsAt is Cocoa's epoch, not Unix's
+    func read(_ raw: Any?, _ fallbackTitle: String? = nil) -> UsageWindow? {
+        guard let d = raw as? [String: Any], let used = d["usedPercent"] as? Double else { return nil }
+        var w = UsageWindow(title: fallbackTitle ?? usageSpan(d["windowMinutes"] as? Int ?? 0),
+                            left: 100 - Int(used.rounded()))
+        if let at = d["resetsAt"] as? Double {
+            w.reset = usageReset(Date(timeIntervalSinceReferenceDate: at))
+        }
+        return w
+    }
+
+    var provider = UsageProvider(name: "codex", short: "CX",
+                                 updated: Date(timeIntervalSinceReferenceDate: updated))
+    for key in ["primary", "secondary", "tertiary"] {
+        if let w = read(snapshot[key]) { provider.windows.append(w) }
+    }
+    for extra in snapshot["extraRateWindows"] as? [[String: Any]] ?? [] {
+        var title = (extra["title"] as? String ?? "").lowercased()
+        if title.hasPrefix("codex ") { title.removeFirst("codex ".count) }
+        if let w = read(extra["window"], title.isEmpty ? nil : title) { provider.windows.append(w) }
+    }
+    let credits = (snapshot["codexResetCredits"] as? [String: Any])?["availableCount"] as? Int ?? 0
+    if credits > 0 { provider.note = "\(credits) limit reset credit\(credits == 1 ? "" : "s")" }
+    return provider.windows.isEmpty ? nil : provider
+}
+
+func claudeUsage() -> UsageProvider? {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: claudeUsagePath)),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let accounts = root["accounts"] as? [String: Any]
+    else { return nil }
+    let iso = ISO8601DateFormatter()
+
+    struct Reading {
+        var title = ""
+        var at = Date.distantPast
+        var reset: Date?
+        var left = 0
+    }
+    func latest(_ raw: Any?) -> [Reading] {
+        guard let series = raw as? [[String: Any]] else { return [] }
+        return series.compactMap { s in
+            guard let entries = s["entries"] as? [[String: Any]], let last = entries.last,
+                  let at = iso.date(from: last["capturedAt"] as? String ?? ""),
+                  let used = last["usedPercent"] as? Double
+            else { return nil }
+            let name = (s["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? usageSpan(s["windowMinutes"] as? Int ?? 0)
+            return Reading(title: name.lowercased(), at: at,
+                           reset: iso.date(from: last["resetsAt"] as? String ?? ""),
+                           left: 100 - Int(used.rounded()))
+        }
+    }
+
+    var readings = latest(accounts[root["preferredAccountKey"] as? String ?? ""])
+    if readings.isEmpty {
+        for value in accounts.values {
+            let candidate = latest(value)
+            if (candidate.map(\.at).max() ?? .distantPast) > (readings.map(\.at).max() ?? .distantPast) {
+                readings = candidate
+            }
+        }
+    }
+    guard let newest = readings.map(\.at).max() else { return nil }
+
+    // A window the plan stopped reporting (an old opus quota) keeps its
+    // last reading in the file forever; only what was captured alongside
+    // the newest reading is still being measured.
+    var provider = UsageProvider(name: "claude", short: "CL", updated: newest)
+    for r in readings where newest.timeIntervalSince(r.at) < usageStaleAfter {
+        provider.windows.append(UsageWindow(title: r.title, left: r.left,
+                                            reset: r.reset.map(usageReset) ?? ""))
+    }
+    return provider.windows.isEmpty ? nil : provider
+}
+
+func updateUsage() {
+    DispatchQueue.global(qos: .utility).async {
+        let providers = [codexUsage(), claudeUsage()].compactMap { $0 }
+        DispatchQueue.main.async {
+            usage = providers
+            guard let newest = providers.map(\.updated).max() else {
+                set("usage") { $0.drawing = false } // no CodexBar, no numbers to invent
+                return
+            }
+            let thinnest = providers.map(\.binding).min() ?? 100
+            var tint = palette.accent
+            if Date().timeIntervalSince(newest) > usageStaleAfter {
+                tint = palette.muted
+            } else if thinnest <= 10 {
+                tint = palette.red
+            } else if thinnest <= 30 {
+                tint = palette.yellow
+            }
+            set("usage") {
+                $0.drawing = true
+                $0.icon = usageGlyph
+                $0.iconColor = tint
+                $0.label = providers.map { "\($0.short) \($0.binding)%" }.joined(separator: " · ")
+            }
+            if openPopup == "usage" { refreshPopup() }
+        }
+    }
+}
+
+// a rewrite arrives as several events; one read after they settle
+var usagePending = false
+func kickUsage() {
+    guard !usagePending else { return }
+    usagePending = true
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        usagePending = false
+        updateUsage()
+    }
+}
+
 // --- popups ----------------------------------------------------------------
 // A popup is a list of rows in its own window. sketchybar has to model
 // these as bar items with a naming convention (`clock.cal.3`) that a
@@ -1683,6 +1869,29 @@ func weatherRows() -> [PopupRow] {
     return rows
 }
 
+func usageRows() -> [PopupRow] {
+    guard !usage.isEmpty else { return [] }
+    var rows: [PopupRow] = [
+        PopupRow(icon: usageGlyph,
+                 text: usage.map { "\($0.name) \($0.binding)%" }.joined(separator: " · ") + " left",
+                 hero: true),
+    ]
+    for provider in usage {
+        for w in provider.windows {
+            var line = "\(provider.name) \(w.title) \(w.left)% left"
+            if !w.reset.isEmpty { line += " · resets in \(w.reset)" }
+            rows.append(PopupRow(text: line))
+        }
+        if !provider.note.isEmpty { rows.append(PopupRow(text: provider.note, dim: true)) }
+    }
+    if let newest = usage.map(\.updated).max() {
+        let age = "updated \(usageAge(newest))"
+        rows.append(PopupRow(text: Date().timeIntervalSince(newest) > usageStaleAfter
+                                ? "stale · \(age)" : age, dim: true))
+    }
+    return rows
+}
+
 // The system menu the hidden native menu bar used to carry, plus the two
 // omacosy actions. "Reload Bar" has no counterpart here on purpose: there
 // is no config to re-read, the theme is watched, and a row that did
@@ -1721,6 +1930,7 @@ func popupRows(for name: String) -> [PopupRow] {
     case "apple": return appleMenuRows()
     case "clock": return calendarRows()
     case "weather": return weatherRows()
+    case "usage": return usageRows()
     case "brightness": return brightnessRows()
     case "volume": return volumeRows()
     case "wifi": return wifiRows()
@@ -3250,6 +3460,11 @@ for event in [NSWorkspace.didLaunchApplicationNotification,
     }
 }
 
+// CodexBar rewrites these when it finishes a poll; the timer below only
+// covers the case where it was replaced under us and the watch went deaf.
+watch(codexUsagePath, create: false) { kickUsage() }
+watch(claudeUsagePath, create: false) { kickUsage() }
+
 // front app: a notification, not a poll and not a script
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -3579,6 +3794,7 @@ func scheduleClock() {
 scheduleClock()
 
 Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in updateWeather() }
+Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in updateUsage() }
 
 // --- go -------------------------------------------------------------------
 
@@ -3602,6 +3818,7 @@ updateBattery()
 updateBrightness()
 updateWifi()
 updateWeather()
+updateUsage()
 repaint()
 primeMedia()
 startOmniWatch() // a no-op under aerospace; the WM observer handles switches
