@@ -15,7 +15,7 @@
 //                           combo/phone/watch/device) for popup icons
 //   bt connect <address> / bt disconnect <address>
 //   input-age               seconds since the last deliberate user input
-//                           (keys/clicks/scroll), for the focus guard
+//                           (keys/clicks/scroll)
 //   brightness              print the built-in display's brightness (0-100)
 //   brightness set <0-100>  set it (DisplayServices — built-in/Apple
 //                           displays only; external DDC is out of scope)
@@ -233,9 +233,7 @@ case "brightness":
 
 case "input-age":
     // seconds since the last DELIBERATE user input (keys, clicks,
-    // scroll — not mouse motion). The focus guard uses this to tell a
-    // user-driven workspace switch from an app yanking focus to
-    // itself.
+    // scroll — not mouse motion).
     let types: [CGEventType] = [.keyDown, .leftMouseDown, .rightMouseDown,
         .otherMouseDown, .scrollWheel]
     let age = types

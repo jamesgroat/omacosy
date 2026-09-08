@@ -233,10 +233,8 @@ static bool switch_on_cursor_monitor(const char* ws)
 	return ok;
 }
 
-// Raw multitouch contacts emit no CGEvents, so omacosy's focus guard
-// (which bounces workspace switches made without recent user input)
-// can't see a swipe. Stamp a file it checks instead. O_TRUNC on an
-// existing file refreshes its mtime — that IS the timestamp.
+// Raw multitouch contacts emit no CGEvents. O_TRUNC on an existing
+// intent file refreshes its mtime — that IS the timestamp.
 static void stamp_user_intent(void)
 {
 	char path[128];
