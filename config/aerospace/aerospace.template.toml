@@ -51,7 +51,7 @@ on-focus-changed = ['exec-and-forget $HOME/.local/bin/omacosy-helper split-hint'
 # Tell the bar which workspace is focused — a bash builtin redirect,
 # no extra process, and a regular file so a dead reader cannot wedge it
 exec-on-workspace-change = ['/bin/bash', '-c',
-  'touch /tmp/omacosy-ws-switch; echo "$AEROSPACE_FOCUSED_WORKSPACE" > /tmp/omacosy-bar-ws; $HOME/.local/bin/omacosy-focus-guard'
+  'touch /tmp/omacosy-ws-switch; echo "$AEROSPACE_FOCUSED_WORKSPACE" > /tmp/omacosy-bar-ws'
 ]
 
 [gaps]

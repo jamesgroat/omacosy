@@ -30,7 +30,7 @@ grant-first, snapshot-backed and auto-reverting.
       renders as Super.
 - [x] WM-aware plumbing — omacosy-ws routes through omniwmctl
       (per-monitor natively, no twin math); collapse/cycle/float/
-      focus-guard/spawn stand down cleanly; toggle records and
+      spawn stand down cleanly; toggle records and
       restarts the right WM; uninstall tears OmniWM down.
 
 ## To verify on the next guarded switch
@@ -274,8 +274,7 @@ is acceptable-by-design; silent WM restarts are not.
 3. **Cheatsheet.** `Super+K` renders bindings parsed from
    aerospace.toml; teach it to read `[[hotkeys]]` from settings.toml
    when OmniWM is active.
-4. **WM-aware plumbing.** `omacosy-toggle`, `uninstall.sh`, the
-   focus-guard, `omacosy-ws`/`-collapse`/`-cycle`/`-float`/`-spawn`:
+4. **WM-aware plumbing.** `omacosy-toggle`, `uninstall.sh`, `omacosy-ws`/`-collapse`/`-cycle`/`-float`/`-spawn`:
    each either gains an OmniWM path, stands down under OmniWM, or is
    retired by a native OmniWM feature (ffm, swipes are native; the
    overview may be next).

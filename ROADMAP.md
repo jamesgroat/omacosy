@@ -24,11 +24,6 @@ Direction, not promises. Ordered roughly by pull.
   visibly stepped) and direct AX `setSize` (smooth, but needs a
   measurement that AeroSpace re-normalizes a fast resize stream the
   way it does a native edge drag).
-- **Focus guard vs. typing.** An app that yanks focus while you are
-  actively typing (input < 2s old) is indistinguishable from a
-  user-driven switch and slips through. A denylist for known
-  offenders (messengers on non-visible workspaces) is the likely
-  escalation.
 - **macOS support matrix.** Built and tested on macOS 26 (Tahoe),
   Apple Silicon, one external display. Sequoia and Intel are
   unknown territory — reports welcome.
