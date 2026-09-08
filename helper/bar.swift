@@ -3367,6 +3367,55 @@ let barRevealLevel = NSWindow.Level(rawValue: 1002)
 let revealEdge: CGFloat = 2 // how close to the top edge counts as asking
 var revealed = false
 
+let menuBarLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+var nativeMenuBarShown: Set<CGDirectDisplayID> = []
+var nativeMenuBarPoll: Timer?
+
+func nativeMenuBarDisplays() -> Set<CGDirectDisplayID> {
+    var shown: Set<CGDirectDisplayID> = []
+    guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]
+    else { return shown }
+    for window in list {
+        guard (window[kCGWindowLayer as String] as? Int) == menuBarLayer,
+              let owner = window[kCGWindowOwnerName as String] as? String,
+              owner == "Window Server" || owner == "WindowManager",
+              let b = window[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+        let rect = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+        for surface in surfaces {
+            let id = screenID(surface.screen)
+            let display = CGDisplayBounds(id)
+            if rect.intersection(display).height > 1, rect.origin.y - display.origin.y < 50 {
+                shown.insert(id)
+            }
+        }
+    }
+    return shown
+}
+
+func pollNativeMenuBar() {
+    let now = nativeMenuBarDisplays()
+    if now != nativeMenuBarShown {
+        nativeMenuBarShown = now
+        updateBarVisibility()
+    }
+    let p = NSEvent.mouseLocation
+    let nearTop = NSScreen.screens.contains {
+        $0.frame.insetBy(dx: 0, dy: -2).contains(p) && $0.frame.maxY - p.y <= 50
+    }
+    if now.isEmpty, !nearTop {
+        nativeMenuBarPoll?.invalidate()
+        nativeMenuBarPoll = nil
+    }
+}
+
+func startNativeMenuBarPoll() {
+    guard nativeMenuBarPoll == nil else { return }
+    let timer = Timer(timeInterval: 0.2, repeats: true) { _ in pollNativeMenuBar() }
+    nativeMenuBarPoll = timer
+    RunLoop.main.add(timer, forMode: .common)
+    pollNativeMenuBar()
+}
+
 func setRevealed(_ show: Bool) {
     guard show != revealed else { return }
     revealed = show
@@ -3393,6 +3442,8 @@ func pointerAtScreenTop() {
         // unreachable by mouse without this.
         if fullscreenDisplays().contains(screenID(screen)) {
             setRevealed(true)
+        } else {
+            startNativeMenuBarPoll()
         }
     } else if revealed, openPopup == nil, fromTop > barHeight + 12 {
         // a popup keeps it up: its anchor must not vanish under the pointer
@@ -3403,7 +3454,8 @@ func pointerAtScreenTop() {
 func updateBarVisibility() {
     let covered = fullscreenDisplays()
     for surface in surfaces {
-        let hide = covered.contains(screenID(surface.screen)) && !revealed
+        let id = screenID(surface.screen)
+        let hide = (covered.contains(id) && !revealed) || nativeMenuBarShown.contains(id)
         // unconditional either way: isVisible can desync from the window
         // server, which is how borders.swift ended up with a stuck shroud
         if hide {
