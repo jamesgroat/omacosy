@@ -1391,6 +1391,18 @@ func claudeLiveUsage() -> UsageProvider? {
         }
         provider.windows.append(window)
     }
+    // Model-scoped weekly carve-outs ("Fable only") arrive as extras, the
+    // way codex's do; the plan dropped the 5-hour session in Oct 2026, so
+    // these are often the only windows besides the weekly.
+    for extra in windows["extraRateWindows"] as? [[String: Any]] ?? [] {
+        guard let d = extra["window"] as? [String: Any], let used = d["usedPercent"] as? Double else { continue }
+        var title = (extra["title"] as? String ?? "").lowercased()
+        if title.hasSuffix(" only") { title.removeLast(" only".count) }
+        var window = UsageWindow(title: title.isEmpty ? usageSpan(d["windowMinutes"] as? Int ?? 0) : title,
+                                 left: 100 - Int(used.rounded()))
+        if let at = iso.date(from: d["resetsAt"] as? String ?? "") { window.reset = usageReset(at) }
+        provider.windows.append(window)
+    }
     return provider.windows.isEmpty ? nil : provider
 }
 
