@@ -1235,6 +1235,7 @@ struct UsageWindow {
     var reset = ""
     var pace = ""
     var deficit = 0 // points spent ahead of an even burn, 0 when on track
+    var scoped = false // a model's own carve-out of the weekly ("fable")
 }
 
 struct UsageProvider {
@@ -1252,12 +1253,18 @@ struct UsageProvider {
     // The session window is what bites during a working day, so it leads
     // whether or not the weekly is thinner; providers without one (codex)
     // fall back to whichever window is closest to empty.
+    // Scoped windows follow by name, since a model that runs dry stops that
+    // model and nothing else.
     var pill: String {
-        guard let session = windows.first(where: { $0.title == "session" }) else {
-            return "\(binding)%"
-        }
         let weekly = windows.first { $0.title == "weekly" }
-        return "\(session.left)%" + (weekly.map { " wk \($0.left)%" } ?? "")
+        var text: String
+        if let session = windows.first(where: { $0.title == "session" }) {
+            text = "\(session.left)%" + (weekly.map { " wk \($0.left)%" } ?? "")
+        } else {
+            text = "\(weekly?.left ?? binding)%"
+        }
+        for w in windows where w.scoped { text += " \(w.title) \(w.left)%" }
+        return text
     }
 }
 
@@ -1399,7 +1406,7 @@ func claudeLiveUsage() -> UsageProvider? {
         var title = (extra["title"] as? String ?? "").lowercased()
         if title.hasSuffix(" only") { title.removeLast(" only".count) }
         var window = UsageWindow(title: title.isEmpty ? usageSpan(d["windowMinutes"] as? Int ?? 0) : title,
-                                 left: 100 - Int(used.rounded()))
+                                 left: 100 - Int(used.rounded()), scoped: true)
         if let at = iso.date(from: d["resetsAt"] as? String ?? "") { window.reset = usageReset(at) }
         provider.windows.append(window)
     }
@@ -2007,7 +2014,7 @@ func weatherRows() -> [PopupRow] {
 func usageRows() -> [PopupRow] {
     guard !usage.isEmpty else { return [] }
     var rows: [PopupRow] = [
-        PopupRow(text: usage.map { "\($0.glyph) \($0.name) \($0.binding)%" }
+        PopupRow(text: usage.map { "\($0.glyph) \($0.name) \($0.pill)" }
             .joined(separator: " · ") + " left", hero: true),
     ]
     for provider in usage {
