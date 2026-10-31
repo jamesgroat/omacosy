@@ -1362,6 +1362,24 @@ func usagePace(_ d: [String: Any]) -> (text: String, deficit: Int) {
     return (text, spending ? max(0, delta) : 0)
 }
 
+// CodexBar paces only the plan's main windows, so a scoped carve-out is
+// paced here the same way: used against the share of the window already
+// gone, and the burn so far extended to see whether it reaches the reset.
+func scopedPace(used: Double, minutes: Int, resetsAt: Date?) -> (text: String, deficit: Int) {
+    guard let resetsAt, minutes > 0 else { return ("", 0) }
+    let span = Double(minutes) * 60
+    let remaining = max(0, resetsAt.timeIntervalSinceNow)
+    let elapsed = span - remaining
+    guard elapsed > 60 else { return ("", 0) }
+    let expected = elapsed / span * 100
+    let delta = Int((used - expected).rounded())
+    let empty = used > 0 ? (100 - used) * elapsed / used : .infinity
+    let lasts = empty >= remaining
+    let outlook = lasts ? "lasts to reset" : "runs out in \(usageReset(Date(timeIntervalSinceNow: empty)))"
+    if delta > 0, !lasts { return ("\(delta)% in deficit · \(outlook)", delta) }
+    return ("on pace · \(outlook)", 0)
+}
+
 func claudeLiveUsage() -> UsageProvider? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: codexBarCLI)
@@ -1405,9 +1423,12 @@ func claudeLiveUsage() -> UsageProvider? {
         guard let d = extra["window"] as? [String: Any], let used = d["usedPercent"] as? Double else { continue }
         var title = (extra["title"] as? String ?? "").lowercased()
         if title.hasSuffix(" only") { title.removeLast(" only".count) }
-        var window = UsageWindow(title: title.isEmpty ? usageSpan(d["windowMinutes"] as? Int ?? 0) : title,
+        let minutes = d["windowMinutes"] as? Int ?? 0
+        var window = UsageWindow(title: title.isEmpty ? usageSpan(minutes) : title,
                                  left: 100 - Int(used.rounded()), scoped: true)
-        if let at = iso.date(from: d["resetsAt"] as? String ?? "") { window.reset = usageReset(at) }
+        let resetsAt = iso.date(from: d["resetsAt"] as? String ?? "")
+        if let resetsAt { window.reset = usageReset(resetsAt) }
+        (window.pace, window.deficit) = scopedPace(used: used, minutes: minutes, resetsAt: resetsAt)
         provider.windows.append(window)
     }
     return provider.windows.isEmpty ? nil : provider
